@@ -1,0 +1,212 @@
+// Olymp Trade WebSocket Interceptor v1.0
+(function() {
+    console.log("🚀 Starting AI Trading Data Collector...");
+    
+    // Store WebSocket instances
+    const originalWebSocket = window.WebSocket;
+    const capturedData = [];
+    const priceHistory = [];
+    let isCollecting = true;
+    
+    // Configuration
+    const config = {
+        serverUrl: "https://olymp-price-collector.onrender.com/price",
+        collectInterval: 1000, // ms
+        maxBufferSize: 1000,
+        pairFilter: "BTCUSD_OTC" // Focus on BTC initially
+    };
+    
+    // Override WebSocket to intercept messages
+    window.WebSocket = function(url, protocols) {
+        console.log(`🔌 WebSocket connecting to: ${url}`);
+        const ws = new originalWebSocket(url, protocols);
+        
+        // Override onmessage to capture data
+        const originalOnMessage = ws.onmessage;
+        ws.onmessage = function(event) {
+            try {
+                const data = JSON.parse(event.data);
+                processWebSocketData(data, event.timeStamp);
+                
+                // Call original handler if exists
+                if (originalOnMessage) {
+                    originalOnMessage.call(this, event);
+                }
+            } catch (e) {
+                console.error("❌ Error parsing WebSocket data:", e);
+            }
+        };
+        
+        return ws;
+    };
+    
+    // Copy WebSocket constants
+    window.WebSocket.CONNECTING = originalWebSocket.CONNECTING;
+    window.WebSocket.OPEN = originalWebSocket.OPEN;
+    window.WebSocket.CLOSING = originalWebSocket.CLOSING;
+    window.WebSocket.CLOSED = originalWebSocket.CLOSED;
+    
+    // Process incoming WebSocket data
+    function processWebSocketData(data, timestamp) {
+        if (!Array.isArray(data)) return;
+        
+        data.forEach(item => {
+            // Event type 1: Price updates
+            if (item.e === 1 && Array.isArray(item.d)) {
+                item.d.forEach(priceUpdate => {
+                    if (priceUpdate.p === config.pairFilter) {
+                        const priceData = {
+                            pair: priceUpdate.p,
+                            price: priceUpdate.q,
+                            timestamp: priceUpdate.t || Date.now()/1000,
+                            event_type: item.e,
+                            server_timestamp: timestamp,
+                            raw_data: JSON.stringify(priceUpdate)
+                        };
+                        
+                        priceHistory.push(priceData);
+                        
+                        // Buffer for batch sending
+                        capturedData.push(priceData);
+                        
+                        // Visual feedback
+                        updatePriceDisplay(priceData);
+                        
+                        // Send to server periodically
+                        if (capturedData.length >= 10) {
+                            sendToServer();
+                        }
+                    }
+                });
+            }
+            // Event type 80: Order book data
+            else if (item.e === 80) {
+                processOrderBookData(item);
+            }
+            // Event type 11: Status updates
+            else if (item.e === 11) {
+                console.log("📊 Status update:", item);
+            }
+        });
+    }
+    
+    // Process order book data
+    function processOrderBookData(item) {
+        if (!Array.isArray(item.d)) return;
+        
+        item.d.forEach(pairData => {
+            if (pairData.p === config.pairFilter) {
+                const orderBook = {
+                    pair: pairData.p,
+                    timestamp: Date.now()/1000,
+                    order_book: pairData.d,
+                    event_type: 80
+                };
+                capturedData.push(orderBook);
+            }
+        });
+    }
+    
+    // Send data to Flask server
+    async function sendToServer() {
+        if (capturedData.length === 0) return;
+        
+        const batch = capturedData.splice(0, Math.min(capturedData.length, 50));
+        
+        try {
+            const response = await fetch(config.serverUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    batch: batch,
+                    timestamp: Date.now()/1000,
+                    user_agent: navigator.userAgent
+                })
+            });
+            
+            if (response.ok) {
+                console.log(`📤 Sent ${batch.length} price updates to server`);
+            } else {
+                console.error('❌ Failed to send data:', await response.text());
+                // Re-add batch to capturedData for retry
+                capturedData.unshift(...batch);
+            }
+        } catch (error) {
+            console.error('❌ Network error:', error);
+            capturedData.unshift(...batch);
+        }
+    }
+    
+    // Create visual overlay
+    function updatePriceDisplay(priceData) {
+        let display = document.getElementById('ai-price-overlay');
+        
+        if (!display) {
+            display = document.createElement('div');
+            display.id = 'ai-price-overlay';
+            display.style.cssText = `
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                background: rgba(0, 0, 0, 0.8);
+                color: white;
+                padding: 10px;
+                border-radius: 5px;
+                font-family: monospace;
+                font-size: 12px;
+                z-index: 999999;
+                border: 1px solid #00ff00;
+                min-width: 200px;
+            `;
+            document.body.appendChild(display);
+        }
+        
+        display.innerHTML = `
+            <div style="color: #00ff00; font-weight: bold;">🤖 AI Collector Active</div>
+            <div>Pair: ${priceData.pair}</div>
+            <div>Price: ${priceData.price.toFixed(2)}</div>
+            <div>Time: ${new Date(priceData.timestamp * 1000).toLocaleTimeString()}</div>
+            <div>Buffer: ${priceHistory.length} ticks</div>
+            <div style="margin-top: 5px; font-size: 10px; color: #aaa;">
+                Collecting: ${isCollecting ? '✅' : '⏸️'}
+            </div>
+        `;
+    }
+    
+    // Batch sending interval
+    setInterval(() => {
+        if (capturedData.length > 0) {
+            sendToServer();
+        }
+    }, config.collectInterval);
+    
+    // Export control functions
+    window.AICollector = {
+        start: () => { isCollecting = true; console.log("▶️ Collection started"); },
+        stop: () => { isCollecting = false; console.log("⏸️ Collection stopped"); },
+        getStats: () => ({
+            totalCaptured: priceHistory.length,
+            bufferSize: capturedData.length,
+            lastPrice: priceHistory[priceHistory.length - 1],
+            isCollecting
+        }),
+        downloadData: () => {
+            const dataStr = JSON.stringify(priceHistory, null, 2);
+            const dataUri = 'data:application/json;charset=utf-8,'+ encodeURIComponent(dataStr);
+            const exportFileDefaultName = `olymp-prices-${Date.now()}.json`;
+            const linkElement = document.createElement('a');
+            linkElement.setAttribute('href', dataUri);
+            linkElement.setAttribute('download', exportFileDefaultName);
+            linkElement.click();
+        }
+    };
+    
+    console.log("✅ AI Collector injected successfully!");
+    console.log("🔄 Control via window.AICollector.start() / stop()");
+    
+    // Initial display
+    updatePriceDisplay({pair: config.pairFilter, price: 0, timestamp: Date.now()/1000});
+    
+})();
