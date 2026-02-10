@@ -1,0 +1,1 @@
+# olymp-price-collector
