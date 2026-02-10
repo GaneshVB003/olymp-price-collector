@@ -1,38 +1,42 @@
-# app.py – Updated with CORS support
-import json, os, datetime, pathlib
+# Update app.py to include candle processing
+from candle_builder import candle_builder
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Add this import
+from flask_cors import CORS
+import json, os, datetime, pathlib
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for now
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Folder where we store daily JSON‑Lines files
+# Create directories
 DATA_ROOT = pathlib.Path(__file__).parent / "prices"
+CANDLE_ROOT = pathlib.Path(__file__).parent / "candles"
 DATA_ROOT.mkdir(exist_ok=True)
+CANDLE_ROOT.mkdir(exist_ok=True)
 
 def _store_batch(payload: dict):
-    """Store batch data with candle aggregation"""
+    """Store batch data and process into candles"""
     try:
         batch = payload.get("batch", [])
         if not batch:
             return
         
         for item in batch:
-            # Add server timestamp if missing
-            if "server_timestamp" not in item:
-                item["server_timestamp"] = datetime.datetime.utcnow().timestamp()
-            
-            # Save each item with date and pair in filename
-            ts = item.get("timestamp", item["server_timestamp"])
+            # Store raw data
+            ts = item.get("timestamp", datetime.datetime.utcnow().timestamp())
             date_str = datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
             pair = item.get("pair", "unknown")
             
-            # Create filename with pair and date
-            filename = DATA_ROOT / f"{pair}_{date_str}.jsonl"
-            
-            # Append JSON line
-            with open(filename, "a", encoding="utf-8") as f:
+            raw_filename = DATA_ROOT / f"{pair}_{date_str}.jsonl"
+            with open(raw_filename, "a", encoding="utf-8") as f:
                 f.write(json.dumps(item) + "\n")
+            
+            # Process into candles if it's a price tick
+            if "price" in item and "pair" in item:
+                price = float(item["price"])
+                timestamp = float(item.get("timestamp", ts))
+                volume = float(item.get("volume", 0))
+                
+                candle_builder.process_tick(pair, price, timestamp, volume)
                 
     except Exception as e:
         print(f"Error storing batch: {e}")
@@ -40,7 +44,6 @@ def _store_batch(payload: dict):
 @app.route("/price", methods=["POST", "OPTIONS"])
 def receive():
     if request.method == "OPTIONS":
-        # Handle preflight request
         return jsonify({"status": "ok"}), 200
     
     try:
@@ -49,8 +52,21 @@ def receive():
             return jsonify({"error": "invalid payload"}), 400
         
         _store_batch(data)
-        return jsonify({"status": "ok", "received": len(data.get("batch", []))}), 200
+        return jsonify({
+            "status": "ok", 
+            "received": len(data.get("batch", [])),
+            "message": "Processing into candles"
+        }), 200
         
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# New endpoint to get current candle status
+@app.route("/candles", methods=["GET"])
+def get_candles():
+    try:
+        candles = candle_builder.get_current_candles()
+        return jsonify({"status": "ok", "candles": candles}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -58,21 +74,22 @@ def receive():
 def health():
     return jsonify({"status": "alive"}), 200
 
-# New endpoint to check collected data
 @app.get("/stats")
 def stats():
     try:
-        files = list(DATA_ROOT.glob("*.jsonl"))
-        total_lines = 0
-        for file in files:
-            with open(file, "r", encoding="utf-8") as f:
-                total_lines += len(f.readlines())
+        raw_files = list(DATA_ROOT.glob("*.jsonl"))
+        candle_files = list(CANDLE_ROOT.glob("*.jsonl"))
+        
+        raw_count = sum(1 for f in raw_files for _ in open(f))
+        candle_count = sum(1 for f in candle_files for _ in open(f))
         
         return jsonify({
             "status": "ok",
-            "files": len(files),
-            "total_entries": total_lines,
-            "data_root": str(DATA_ROOT)
+            "raw_files": len(raw_files),
+            "candle_files": len(candle_files),
+            "raw_entries": raw_count,
+            "candle_entries": candle_count,
+            "current_candles": len(candle_builder.get_current_candles())
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
