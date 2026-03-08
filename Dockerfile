@@ -1,15 +1,23 @@
-# Use the official lightweight Python image
 FROM python:3.11-slim
+
+WORKDIR /app
 
 # Install dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the app
+# Copy app
 COPY app.py .
 
-# Expose the port Render will use
+# Create persistent data directories
+RUN mkdir -p data/ticks data/candles data/orderbook \
+             data/sentiment data/predictions data/sessions
+
 EXPOSE 5000
 
-# Run the Flask app
-CMD ["python", "app.py"]
+CMD ["gunicorn", "app:app", \
+     "--workers", "2", \
+     "--threads", "4", \
+     "--timeout", "60", \
+     "--bind", "0.0.0.0:5000", \
+     "--log-level", "info"]
