@@ -1,871 +1,937 @@
-# app.py - ULTIMATE CANDLE BUILDER WITH ALL TIMEFRAMES
-import json, os, datetime, pathlib, time, threading, math, statistics
-import pandas as pd
-import numpy as np
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+"""
+╔══════════════════════════════════════════════════════════════╗
+║      QUANTUM OLYMPTRADE AI — RENDER SERVER  v2.0             ║
+║  Receives all WebSocket data from Tampermonkey               ║
+║  Builds 15-timeframe candles per instrument                  ║
+║  Serves Colab AI + Dashboard + Notification system           ║
+╚══════════════════════════════════════════════════════════════╝
+Deploy on Render.com (free tier).  Start command: python app.py
+"""
+
+import os, json, time, threading, pathlib, datetime, math
 from collections import defaultdict, deque
-from typing import Dict, List, Optional, Tuple
-import hashlib
+from typing import Dict, List, Optional, Any
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
 
-app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+# ═══════════════════════════════════════════════════════════════
+# 0.  BOOTSTRAP — auto-install missing packages on Render
+# ═══════════════════════════════════════════════════════════════
+import subprocess, sys
 
-# ================================================================
-# ULTIMATE CANDLE BUILDER WITH 14 TIMEFRAMES
-# ================================================================
-
-class UltimateCandleBuilder:
-    """Professional-grade candle builder for 14 timeframes with real-time indicators"""
-    
-    def __init__(self):
-        # ALL TIMEFRAMES from 5s to 30d
-        self.timeframes = [
-            "5s", "10s", "20s", "30s",      # Seconds
-            "1m", "2m", "5m", "10m",        # Minutes  
-            "15m", "30m", "1h", "4h",       # Hours
-            "1d", "7d", "30d"               # Days
-        ]
-        
-        # Candle storage
-        self.candle_data = {}
-        self.candle_history = defaultdict(lambda: defaultdict(deque))  # pair -> tf -> deque
-        self.technical_indicators = defaultdict(dict)
-        self.lock = threading.Lock()
-        self.pattern_detector = PatternDetector()
-        
-        # Create directory structure
-        self.base_dir = pathlib.Path(__file__).parent
-        self.prices_dir = self.base_dir / "prices"
-        self.candles_dir = self.base_dir / "candles"
-        self.indicators_dir = self.base_dir / "indicators"
-        self.models_dir = self.base_dir / "models"
-        
-        for dir_path in [self.prices_dir, self.candles_dir, self.indicators_dir, self.models_dir]:
-            dir_path.mkdir(exist_ok=True)
-        
-        # Initialize candle structures
-        for tf in self.timeframes:
-            self.candle_data[tf] = {
-                "open": None, "high": None, "low": None, "close": None,
-                "volume": 0, "ticks": 0, "start_time": None, "end_time": None,
-                "pair": None, "timeframe": tf, "vwap": 0, "buy_volume": 0, "sell_volume": 0
-            }
-        
-        print(f"🔥 ULTIMATE CandleBuilder initialized with {len(self.timeframes)} timeframes")
-        print(f"📊 Timeframes: {', '.join(self.timeframes)}")
-        
-        # Start background processors
-        self._start_candle_manager()
-        self._start_indicator_calculator()
-        self._start_pattern_scanner()
-    
-    def _start_candle_manager(self):
-        """Manage candle lifecycle"""
-        def manager():
-            while True:
-                try:
-                    with self.lock:
-                        self._force_close_expired_candles()
-                        self._archive_old_candles()
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"⚠️ Candle manager error: {e}")
-                    time.sleep(5)
-        
-        threading.Thread(target=manager, daemon=True).start()
-    
-    def _start_indicator_calculator(self):
-        """Calculate indicators in background"""
-        def calculator():
-            while True:
-                try:
-                    with self.lock:
-                        self._calculate_all_indicators()
-                    time.sleep(5)  # Calculate every 5 seconds
-                except Exception as e:
-                    print(f"⚠️ Indicator calculator error: {e}")
-                    time.sleep(10)
-        
-        threading.Thread(target=calculator, daemon=True).start()
-    
-    def _start_pattern_scanner(self):
-        """Scan for candle patterns"""
-        def scanner():
-            while True:
-                try:
-                    with self.lock:
-                        self._scan_all_patterns()
-                    time.sleep(10)
-                except Exception as e:
-                    print(f"⚠️ Pattern scanner error: {e}")
-                    time.sleep(20)
-        
-        threading.Thread(target=scanner, daemon=True).start()
-    
-    def _tf_to_seconds(self, tf: str) -> int:
-        """Convert any timeframe to seconds"""
-        unit = tf[-1]
-        value = int(tf[:-1])
-        
-        if unit == 's': return value
-        elif unit == 'm': return value * 60
-        elif unit == 'h': return value * 3600
-        elif unit == 'd': return value * 86400
-        elif unit == 'w': return value * 604800
-        elif unit == 'M': return value * 2592000
-        return 1
-    
-    def process_tick(self, pair: str, price: float, timestamp: float, volume: float = 0, side: str = 'neutral'):
-        """Process a tick into ALL timeframes"""
-        with self.lock:
-            for tf in self.timeframes:
-                self._update_candle(tf, pair, price, timestamp, volume, side)
-    
-    def _update_candle(self, tf: str, pair: str, price: float, timestamp: float, volume: float, side: str):
-        """Update candle for specific timeframe"""
-        tf_seconds = self._tf_to_seconds(tf)
-        candle_start = int(timestamp // tf_seconds) * tf_seconds
-        
-        candle = self.candle_data[tf]
-        
-        # New candle period
-        if candle["start_time"] != candle_start:
-            # Save completed candle
-            if candle["start_time"] is not None and candle["pair"]:
-                self._save_completed_candle(tf, candle["pair"], candle)
-            
-            # Start new candle
-            candle.update({
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": volume,
-                "ticks": 1,
-                "start_time": candle_start,
-                "end_time": candle_start + tf_seconds,
-                "pair": pair,
-                "vwap": price * volume,
-                "buy_volume": volume if side == 'buy' else 0,
-                "sell_volume": volume if side == 'sell' else 0
-            })
-        else:
-            # Update existing candle
-            if candle["pair"] is None:
-                candle["pair"] = pair
-                candle["open"] = price
-            
-            candle["high"] = max(candle["high"] or price, price)
-            candle["low"] = min(candle["low"] or price, price)
-            candle["close"] = price
-            candle["volume"] += volume
-            candle["ticks"] += 1
-            candle["vwap"] += price * volume
-            
-            # Track buy/sell volume
-            if side == 'buy':
-                candle["buy_volume"] += volume
-            elif side == 'sell':
-                candle["sell_volume"] += volume
-    
-    def _save_completed_candle(self, tf: str, pair: str, candle: Dict):
-        """Save completed candle with full analysis"""
-        try:
-            # Enhance candle with indicators
-            enhanced = self._enhance_candle_with_indicators(candle.copy())
-            
-            # Add pattern recognition
-            enhanced["patterns"] = self._detect_candle_patterns(enhanced, pair, tf)
-            
-            # Save to file
-            date_str = datetime.datetime.utcfromtimestamp(candle["start_time"]).strftime("%Y-%m-%d")
-            filename = self.candles_dir / f"{pair}_{tf}_{date_str}.jsonl"
-            
-            with open(filename, "a", encoding="utf-8") as f:
-                f.write(json.dumps(enhanced) + "\n")
-            
-            # Store in history (max 5000 candles per timeframe)
-            key = f"{pair}_{tf}"
-            self.candle_history[pair][tf].append(enhanced)
-            if len(self.candle_history[pair][tf]) > 5000:
-                self.candle_history[pair][tf].popleft()
-            
-            print(f"💾 {tf} candle saved: {pair} @ {enhanced.get('close', 0):.2f} "
-                  f"(Δ: {enhanced.get('change_pct', 0):+.2f}%)")
-            
-        except Exception as e:
-            print(f"❌ Error saving {tf} candle: {e}")
-    
-    def _enhance_candle_with_indicators(self, candle: Dict) -> Dict:
-        """Add comprehensive technical indicators to candle"""
-        try:
-            o = candle.get("open", 0)
-            h = candle.get("high", 0)
-            l = candle.get("low", 0)
-            c = candle.get("close", 0)
-            v = candle.get("volume", 0)
-            bv = candle.get("buy_volume", 0)
-            sv = candle.get("sell_volume", 0)
-            
-            # 1. PRICE METRICS
-            if o and c:
-                candle["change"] = c - o
-                candle["change_pct"] = ((c - o) / o * 100) if o != 0 else 0
-                candle["range"] = h - l
-                candle["range_pct"] = ((h - l) / l * 100) if l != 0 else 0
-                
-                # Candle body metrics
-                body_size = abs(c - o)
-                candle["body_pct"] = (body_size / o * 100) if o != 0 else 0
-                
-                # Wick calculations
-                if c > o:  # Bullish
-                    upper_wick = h - c
-                    lower_wick = o - l
-                else:  # Bearish
-                    upper_wick = h - o
-                    lower_wick = c - l
-                
-                candle["upper_wick_pct"] = (upper_wick / o * 100) if o != 0 else 0
-                candle["lower_wick_pct"] = (lower_wick / o * 100) if o != 0 else 0
-                candle["wick_ratio"] = (upper_wick / lower_wick) if lower_wick != 0 else 0
-            
-            # 2. VOLUME METRICS
-            if v > 0:
-                candle["vwap_price"] = candle.get("vwap", 0) / v if v > 0 else c
-                candle["buy_sell_ratio"] = bv / sv if sv > 0 else 0
-                candle["volume_imbalance"] = (bv - sv) / v * 100
-                candle["avg_tick_size"] = v / candle.get("ticks", 1)
-            
-            # 3. TIMING METRICS
-            candle["duration_seconds"] = candle.get("end_time", 0) - candle.get("start_time", 0)
-            candle["ticks_per_second"] = candle.get("ticks", 0) / candle["duration_seconds"] if candle["duration_seconds"] > 0 else 0
-            
-            # 4. ADDITIONAL METRICS
-            candle["mid_price"] = (h + l) / 2
-            candle["typical_price"] = (h + l + c) / 3
-            candle["weighted_close"] = (h + l + 2 * c) / 4
-            
-            # Timestamps
-            candle["processed_at"] = time.time()
-            candle["processed_at_iso"] = datetime.datetime.utcnow().isoformat()
-            
-        except Exception as e:
-            print(f"⚠️ Error enhancing candle: {e}")
-        
-        return candle
-    
-    def _calculate_all_indicators(self):
-        """Calculate comprehensive technical indicators for all pairs/timeframes"""
-        for pair in list(self.candle_history.keys()):
-            for tf in self.timeframes:
-                history = list(self.candle_history[pair][tf])
-                if len(history) >= 20:  # Need minimum data
-                    indicators = self._calculate_technical_indicators(history)
-                    self.technical_indicators[f"{pair}_{tf}"] = indicators
-    
-    def _calculate_technical_indicators(self, candles: List[Dict]) -> Dict:
-        """Calculate 50+ technical indicators"""
-        if len(candles) < 20:
-            return {}
-        
-        try:
-            # Convert to pandas for calculation
-            df = pd.DataFrame(candles)
-            
-            # Ensure required columns
-            if 'close' not in df.columns or len(df) < 20:
-                return {}
-            
-            close = df['close'].values
-            high = df['high'].values if 'high' in df.columns else close
-            low = df['low'].values if 'low' in df.columns else close
-            volume = df['volume'].values if 'volume' in df.columns else np.ones(len(close))
-            
-            indicators = {}
-            
-            # 1. MOVING AVERAGES (10 indicators)
-            for period in [5, 10, 20, 50, 100, 200]:
-                if len(close) >= period:
-                    indicators[f'SMA_{period}'] = np.mean(close[-period:])
-                    indicators[f'EMA_{period}'] = self._calculate_ema(close, period)[-1]
-                    indicators[f'WMA_{period}'] = self._calculate_wma(close, period)[-1]
-            
-            # 2. OSCILLATORS (15 indicators)
-            indicators.update(self._calculate_oscillators(close, high, low))
-            
-            # 3. VOLATILITY INDICATORS (10 indicators)
-            indicators.update(self._calculate_volatility_indicators(close, high, low))
-            
-            # 4. VOLUME INDICATORS (10 indicators)
-            indicators.update(self._calculate_volume_indicators(close, volume))
-            
-            # 5. MOMENTUM INDICATORS (5 indicators)
-            indicators.update(self._calculate_momentum_indicators(close))
-            
-            # 6. SUPPORT/RESISTANCE (5 indicators)
-            indicators.update(self._calculate_support_resistance(close, high, low))
-            
-            return indicators
-            
-        except Exception as e:
-            print(f"⚠️ Error calculating indicators: {e}")
-            return {}
-    
-    def _calculate_oscillators(self, close, high, low):
-        """Calculate oscillator indicators"""
-        indicators = {}
-        
-        # RSI
-        if len(close) >= 14:
-            deltas = np.diff(close)
-            seed = deltas[:14]
-            up = seed[seed >= 0].sum() / 14
-            down = -seed[seed < 0].sum() / 14
-            rs = up / down if down != 0 else 0
-            indicators['RSI'] = 100 - (100 / (1 + rs))
-        
-        # Stochastic
-        if len(high) >= 14:
-            low_14 = np.min(low[-14:])
-            high_14 = np.max(high[-14:])
-            if high_14 != low_14:
-                indicators['Stoch_%K'] = 100 * ((close[-1] - low_14) / (high_14 - low_14))
-        
-        # Williams %R
-        if len(high) >= 14:
-            highest_high = np.max(high[-14:])
-            lowest_low = np.min(low[-14:])
-            if highest_high != lowest_low:
-                indicators['Williams_%R'] = -100 * ((highest_high - close[-1]) / (highest_high - lowest_low))
-        
-        return indicators
-    
-    def _calculate_volatility_indicators(self, close, high, low):
-        """Calculate volatility indicators"""
-        indicators = {}
-        
-        # Bollinger Bands
-        if len(close) >= 20:
-            sma_20 = np.mean(close[-20:])
-            std_20 = np.std(close[-20:])
-            indicators['BB_upper'] = sma_20 + 2 * std_20
-            indicators['BB_middle'] = sma_20
-            indicators['BB_lower'] = sma_20 - 2 * std_20
-            indicators['BB_width'] = (indicators['BB_upper'] - indicators['BB_lower']) / sma_20
-        
-        # ATR
-        if len(high) >= 14:
-            tr = np.maximum(high[-1] - low[-1], 
-                          np.abs(high[-1] - close[-2]), 
-                          np.abs(low[-1] - close[-2]))
-            indicators['ATR'] = tr
-        
-        return indicators
-    
-    def _calculate_volume_indicators(self, close, volume):
-        """Calculate volume indicators"""
-        indicators = {}
-        
-        if len(volume) >= 20:
-            # Volume SMA
-            indicators['Volume_SMA_20'] = np.mean(volume[-20:])
-            
-            # Volume ratio
-            indicators['Volume_Ratio'] = volume[-1] / indicators['Volume_SMA_20'] if indicators['Volume_SMA_20'] > 0 else 1
-        
-        # OBV approximation
-        if len(close) > 1 and len(volume) > 1:
-            obv = 0
-            for i in range(1, min(len(close), len(volume))):
-                if close[i] > close[i-1]:
-                    obv += volume[i]
-                elif close[i] < close[i-1]:
-                    obv -= volume[i]
-            indicators['OBV'] = obv
-        
-        return indicators
-    
-    def _calculate_momentum_indicators(self, close):
-        """Calculate momentum indicators"""
-        indicators = {}
-        
-        if len(close) >= 12:
-            # MACD components
-            ema_12 = self._calculate_ema(close, 12)[-1]
-            ema_26 = self._calculate_ema(close, 26)[-1]
-            indicators['MACD'] = ema_12 - ema_26
-            
-            # Signal line (EMA of MACD)
-            if len(close) >= 26:
-                macd_values = ema_12 - ema_26
-                indicators['MACD_signal'] = self._calculate_ema(np.array([macd_values]), 9)[-1]
-        
-        # Rate of Change
-        if len(close) >= 10:
-            indicators['ROC_10'] = ((close[-1] - close[-10]) / close[-10]) * 100
-        
-        return indicators
-    
-    def _calculate_support_resistance(self, close, high, low):
-        """Calculate support/resistance levels"""
-        indicators = {}
-        
-        if len(close) >= 20:
-            # Pivot Points
-            pivot = (high[-1] + low[-1] + close[-1]) / 3
-            indicators['Pivot'] = pivot
-            indicators['R1'] = 2 * pivot - low[-1]
-            indicators['S1'] = 2 * pivot - high[-1]
-            indicators['R2'] = pivot + (high[-1] - low[-1])
-            indicators['S2'] = pivot - (high[-1] - low[-1])
-        
-        return indicators
-    
-    def _calculate_ema(self, prices, period):
-        """Calculate Exponential Moving Average"""
-        if len(prices) < period:
-            return np.array([np.nan] * len(prices))
-        
-        alpha = 2 / (period + 1)
-        ema = np.zeros_like(prices, dtype=float)
-        ema[period-1] = np.mean(prices[:period])
-        
-        for i in range(period, len(prices)):
-            ema[i] = alpha * prices[i] + (1 - alpha) * ema[i-1]
-        
-        return ema
-    
-    def _calculate_wma(self, prices, period):
-        """Calculate Weighted Moving Average"""
-        if len(prices) < period:
-            return np.array([np.nan] * len(prices))
-        
-        weights = np.arange(1, period + 1)
-        wma = np.zeros_like(prices, dtype=float)
-        
-        for i in range(period-1, len(prices)):
-            wma[i] = np.sum(prices[i-period+1:i+1] * weights) / np.sum(weights)
-        
-        return wma
-    
-    def _detect_candle_patterns(self, candle: Dict, pair: str, tf: str) -> List[str]:
-        """Detect Japanese candlestick patterns"""
-        patterns = []
-        
-        try:
-            history = list(self.candle_history[pair][tf])
-            if len(history) < 3:
-                return patterns
-            
-            current = candle
-            prev1 = history[-1] if len(history) >= 1 else None
-            prev2 = history[-2] if len(history) >= 2 else None
-            prev3 = history[-3] if len(history) >= 3 else None
-            
-            if not all([current, prev1, prev2]):
-                return patterns
-            
-            # Extract prices
-            c_o, c_h, c_l, c_c = current.get('open', 0), current.get('high', 0), current.get('low', 0), current.get('close', 0)
-            p1_o, p1_h, p1_l, p1_c = prev1.get('open', 0), prev1.get('high', 0), prev1.get('low', 0), prev1.get('close', 0)
-            p2_o, p2_h, p2_l, p2_c = prev2.get('open', 0), prev2.get('high', 0), prev2.get('low', 0), prev2.get('close', 0)
-            
-            # Calculate body sizes
-            c_body = abs(c_c - c_o)
-            p1_body = abs(p1_c - p1_o)
-            p2_body = abs(p2_c - p2_o)
-            
-            # 1. DOJI PATTERNS
-            doji_threshold = 0.1  # 0.1% of price
-            if c_body / c_o * 100 < doji_threshold:
-                patterns.append("Doji")
-            
-            # 2. HAMMER/HANGING MAN
-            lower_wick = min(c_o, c_c) - c_l
-            upper_wick = c_h - max(c_o, c_c)
-            body_size = c_body
-            
-            if lower_wick > 2 * body_size and upper_wick < body_size * 0.3:
-                patterns.append("Hammer" if c_c > c_o else "Hanging_Man")
-            
-            # 3. ENGULFING PATTERNS
-            if p1_body > 0 and c_body > 0:
-                if c_c > c_o and p1_c < p1_o:  # Bullish engulfing
-                    if c_o < p1_c and c_c > p1_o:
-                        patterns.append("Bullish_Engulfing")
-                elif c_c < c_o and p1_c > p1_o:  # Bearish engulfing
-                    if c_o > p1_c and c_c < p1_o:
-                        patterns.append("Bearish_Engulfing")
-            
-            # 4. MORNING/EVENING STAR
-            if prev3:
-                p3_o, p3_h, p3_l, p3_c = prev3.get('open', 0), prev3.get('high', 0), prev3.get('low', 0), prev3.get('close', 0)
-                p3_body = abs(p3_c - p3_o)
-                
-                if p2_body < p1_body * 0.5 and p2_body < p3_body * 0.5:  # Small middle candle
-                    if p3_c < p3_o and c_c > c_o:  # Down then up
-                        patterns.append("Morning_Star")
-                    elif p3_c > p3_o and c_c < c_o:  # Up then down
-                        patterns.append("Evening_Star")
-            
-            # 5. THREE WHITE SOLDIERS/BLACK CROWS
-            if prev2 and prev1:
-                if c_c > c_o and p1_c > p1_o and p2_c > p2_o:
-                    if c_c > p1_c and p1_c > p2_c:
-                        patterns.append("Three_White_Soldiers")
-                elif c_c < c_o and p1_c < p1_o and p2_c < p2_o:
-                    if c_c < p1_c and p1_c < p2_c:
-                        patterns.append("Three_Black_Crows")
-            
-        except Exception as e:
-            print(f"⚠️ Pattern detection error: {e}")
-        
-        return patterns
-    
-    def _scan_all_patterns(self):
-        """Scan all timeframes for patterns"""
-        for pair in list(self.candle_history.keys()):
-            for tf in self.timeframes:
-                history = list(self.candle_history[pair][tf])
-                if len(history) >= 5:
-                    patterns = self.pattern_detector.scan(history[-5:])
-                    if patterns:
-                        print(f"🎯 Patterns found for {pair} {tf}: {patterns}")
-    
-    def _force_close_expired_candles(self):
-        """Force close candles that have expired"""
-        current_time = time.time()
-        for tf in self.timeframes:
-            candle = self.candle_data[tf]
-            if candle["start_time"] and candle["end_time"] < current_time:
-                if candle["pair"]:
-                    self._save_completed_candle(tf, candle["pair"], candle)
-                # Reset candle
-                for key in ["open", "high", "low", "close", "volume", "ticks", "start_time", "end_time", "pair", "vwap", "buy_volume", "sell_volume"]:
-                    if key in ["timeframe"]:
-                        continue
-                    candle[key] = None
-                candle["volume"] = 0
-                candle["ticks"] = 0
-                candle["vwap"] = 0
-                candle["buy_volume"] = 0
-                candle["sell_volume"] = 0
-    
-    def _archive_old_candles(self):
-        """Archive old candle data"""
-        try:
-            cutoff = time.time() - (30 * 86400)  # 30 days
-            for file in self.candles_dir.glob("*.jsonl"):
-                if file.stat().st_mtime < cutoff:
-                    # Instead of deleting, compress or move to archive
-                    pass
-        except:
-            pass
-    
-    def get_current_candles(self) -> Dict:
-        """Get all current candles"""
-        with self.lock:
-            return {tf: candle.copy() for tf, candle in self.candle_data.items() 
-                   if candle["start_time"] is not None}
-    
-    def get_historical_candles(self, pair: str, tf: str, limit: int = 100) -> List:
-        """Get historical candles"""
-        return list(self.candle_history.get(pair, {}).get(tf, deque()))[-limit:]
-    
-    def get_indicators(self, pair: str, tf: str) -> Dict:
-        """Get calculated indicators"""
-        return self.technical_indicators.get(f"{pair}_{tf}", {})
-    
-    def get_all_analysis(self, pair: str) -> Dict:
-        """Get complete analysis for a pair"""
-        analysis = {}
-        
-        for tf in self.timeframes:
-            candles = self.get_historical_candles(pair, tf, 50)
-            indicators = self.get_indicators(pair, tf)
-            current = self.candle_data[tf]
-            
-            if candles:
-                latest = candles[-1]
-                analysis[tf] = {
-                    "current_price": current.get("close") if current.get("pair") == pair else latest.get("close"),
-                    "indicators": indicators,
-                    "patterns": latest.get("patterns", []),
-                    "change_pct": latest.get("change_pct", 0),
-                    "volume": latest.get("volume", 0)
-                }
-        
-        return analysis
-
-# Pattern Detector Helper Class
-class PatternDetector:
-    def __init__(self):
-        self.patterns = {}
-    
-    def scan(self, candles: List[Dict]) -> List[str]:
-        """Scan candles for patterns"""
-        detected = []
-        
-        if len(candles) < 3:
-            return detected
-        
-        # Simple pattern detection logic
-        # Can be expanded with more sophisticated pattern recognition
-        return detected
-
-# Initialize the ultimate candle builder
-candle_builder = UltimateCandleBuilder()
-
-# ================================================================
-# FLASK ENDPOINTS FOR TRADING AI
-# ================================================================
-
-@app.route("/price", methods=["POST", "OPTIONS"])
-def receive_tick():
-    """Receive price ticks"""
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-    
+def _ensure(pkg, imp=None):
+    imp = imp or pkg
     try:
-        data = request.get_json(force=True)
-        if not data:
-            return jsonify({"error": "invalid payload"}), 400
-        
-        batch = data.get("batch", [])
-        print(f"📥 Received {len(batch)} ticks at {datetime.datetime.utcnow().strftime('%H:%M:%S')}")
-        
-        processed = 0
-        for item in batch:
+        __import__(imp)
+    except ImportError:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', pkg])
+
+_ensure('flask');  _ensure('flask-cors', 'flask_cors')
+
+# ═══════════════════════════════════════════════════════════════
+# 1.  CONFIG
+# ═══════════════════════════════════════════════════════════════
+class CFG:
+    PORT              = int(os.getenv('PORT', 5000))
+    DATA_DIR          = pathlib.Path('./data')
+    MAX_TICKS_RAM     = 3000    # ticks kept in RAM per instrument
+    MAX_CANDLES_RAM   = 2000    # candles per timeframe per instrument (RAM)
+    MAX_NOTIFS        = 200     # notifications kept in RAM
+    CANDLE_FLUSH_SEC  = 10      # write candles to disk every N seconds
+    SESSION_TTL_SEC   = 86400   # 24-hour session lifetime
+    MAX_BATCH_SIZE    = 500     # max items accepted per POST /tick
+
+    # All 15 timeframes in seconds
+    TIMEFRAMES: Dict[str, int] = {
+        '1s':  1,   '5s':  5,   '10s': 10,  '15s': 15,  '30s': 30,
+        '1m':  60,  '2m':  120, '3m':  180, '5m':  300,
+        '10m': 600, '15m': 900, '30m': 1800,
+        '1h':  3600,'4h':  14400,'1d': 86400
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# 2.  DIRECTORY SETUP
+# ═══════════════════════════════════════════════════════════════
+for sub in ['ticks', 'candles', 'orderbook', 'sentiment', 'predictions', 'sessions']:
+    (CFG.DATA_DIR / sub).mkdir(parents=True, exist_ok=True)
+
+# ═══════════════════════════════════════════════════════════════
+# 3.  THREAD-SAFE HELPERS
+# ═══════════════════════════════════════════════════════════════
+def now_ts() -> float:
+    return time.time()
+
+def utc_str() -> str:
+    return datetime.datetime.utcnow().isoformat()
+
+def append_jsonl(path: pathlib.Path, obj: Any):
+    """Append one JSON line to a file (thread-safe via GIL on CPython)."""
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    except Exception as e:
+        print(f'[DISK] write error {path}: {e}')
+
+def read_jsonl_tail(path: pathlib.Path, n: int) -> List[dict]:
+    """Read last N lines from a JSONL file efficiently."""
+    if not path.exists():
+        return []
+    lines = []
+    try:
+        with open(path, 'rb') as f:
+            # seek from end for large files
             try:
-                # Save raw tick
-                ts = item.get("timestamp", time.time())
-                date_str = datetime.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
-                pair = item.get("pair", "unknown")
-                
-                filename = candle_builder.prices_dir / f"{pair}_{date_str}.jsonl"
-                with open(filename, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(item) + "\n")
-                
-                # Process into candles
-                if "price" in item and "pair" in item:
-                    price = float(item["price"])
-                    timestamp = float(item.get("timestamp", ts))
-                    volume = float(item.get("volume", 0))
-                    
-                    # Determine side if available
-                    side = item.get("side", "neutral")
-                    
-                    candle_builder.process_tick(pair, price, timestamp, volume, side)
-                    processed += 1
-                    
-            except Exception as e:
-                print(f"❌ Error processing tick: {e}")
-                continue
-        
-        return jsonify({
-            "status": "ok", 
-            "received": len(batch),
-            "processed": processed,
-            "active_timeframes": len([tf for tf in candle_builder.timeframes 
-                                     if candle_builder.candle_data[tf]["start_time"]])
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+                f.seek(0, 2)
+                size = f.tell()
+                chunk = min(size, n * 300)   # estimate 300 bytes/line
+                f.seek(max(0, size - chunk))
+                raw = f.read().decode('utf-8', errors='ignore').splitlines()
+                for line in raw[-n:]:
+                    line = line.strip()
+                    if line:
+                        try:
+                            lines.append(json.loads(line))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return lines
 
-@app.route("/candles", methods=["GET"])
-def get_current_candles():
-    """Get current live candles for all timeframes"""
-    try:
-        candles = candle_builder.get_current_candles()
-        return jsonify({
-            "status": "ok", 
-            "candles": candles,
-            "timestamp": time.time(),
-            "total_timeframes": len(candle_builder.timeframes)
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# ═══════════════════════════════════════════════════════════════
+# 4.  CANDLE BUILDER  — 15 timeframes, per instrument
+# ═══════════════════════════════════════════════════════════════
+class CandleBuilder:
+    """
+    Receives price ticks, maintains live OHLCV candles for all 15 timeframes.
+    Stores completed candles in RAM deques AND flushes to disk JSONL files.
+    """
 
-@app.route("/analysis/<pair>", methods=["GET"])
-def analyze_pair(pair: str):
-    """Complete multi-timeframe analysis"""
-    try:
-        analysis = candle_builder.get_all_analysis(pair)
-        
-        # Calculate summary statistics
-        summary = {
-            "pair": pair,
-            "timeframes_analyzed": len(analysis),
-            "bullish_timeframes": sum(1 for tf in analysis.values() if tf.get("change_pct", 0) > 0),
-            "bearish_timeframes": sum(1 for tf in analysis.values() if tf.get("change_pct", 0) < 0),
-            "strongest_tf": max(analysis.items(), key=lambda x: abs(x[1].get("change_pct", 0)))[0] if analysis else None,
-            "analysis_time": datetime.datetime.utcnow().isoformat()
+    def __init__(self):
+        self._lock    = threading.RLock()
+        # live open candle per instrument per timeframe
+        # { pair: { tf: { open, high, low, close, volume, ticks, period_start, period_end } } }
+        self._live: Dict[str, Dict[str, dict]] = defaultdict(dict)
+        # completed candles in RAM
+        # { pair: { tf: deque([candle, ...]) } }
+        self._history: Dict[str, Dict[str, deque]] = defaultdict(
+            lambda: defaultdict(lambda: deque(maxlen=CFG.MAX_CANDLES_RAM))
+        )
+        self._pending_flush: List[tuple] = []   # (pair, tf, candle)
+        self._start_flush_thread()
+
+    # ── public: feed one tick ──────────────────────────────────
+    def tick(self, pair: str, price: float, ts: float):
+        with self._lock:
+            for tf, sec in CFG.TIMEFRAMES.items():
+                period = int(ts // sec) * sec
+                live   = self._live[pair].get(tf)
+
+                if live is None or live['period_start'] != period:
+                    # close old candle
+                    if live is not None:
+                        closed = self._close(live)
+                        self._history[pair][tf].append(closed)
+                        self._pending_flush.append((pair, tf, closed))
+                    # open new candle
+                    self._live[pair][tf] = {
+                        'pair': pair, 'tf': tf,
+                        'period_start': period,
+                        'period_end':   period + sec,
+                        'open':  price, 'high':  price,
+                        'low':   price, 'close': price,
+                        'volume': 0,    'ticks':  1
+                    }
+                else:
+                    live['high']   = max(live['high'], price)
+                    live['low']    = min(live['low'],  price)
+                    live['close']  = price
+                    live['ticks'] += 1
+
+    # ── public: feed a pre-built candle from e:1003 ───────────
+    def ingest_candle(self, pair: str, o: float, h: float,
+                      l: float, c: float, ts: float):
+        """Accept OHLCV candles that OlympTrade sends directly (e:1003)."""
+        with self._lock:
+            # treat as a 1-second candle; also update live price
+            self.tick(pair, c, ts)
+            # store the richer e:1003 candle into 1s history directly
+            candle = {
+                'pair': pair, 'tf': '1s',
+                'period_start': int(ts),
+                'period_end':   int(ts) + 1,
+                'open': o, 'high': h, 'low': l, 'close': c,
+                'volume': 0, 'ticks': 1,
+                'source': 'e1003'
+            }
+            self._history[pair]['1s'].append(candle)
+
+    # ── public: get candles ────────────────────────────────────
+    def get(self, pair: str, tf: str, n: int = 500) -> List[dict]:
+        with self._lock:
+            hist = list(self._history[pair][tf])[-n:]
+            # append live candle snapshot if exists
+            live = self._live[pair].get(tf)
+            if live:
+                snap = live.copy()
+                snap['live'] = True
+                hist = hist + [snap]
+            return hist
+
+    def get_live_price(self, pair: str) -> Optional[float]:
+        with self._lock:
+            live = self._live[pair].get('1s') or self._live[pair].get('5s')
+            return live['close'] if live else None
+
+    def instruments(self) -> List[str]:
+        with self._lock:
+            return sorted(self._live.keys())
+
+    def candle_counts(self, pair: str) -> Dict[str, int]:
+        with self._lock:
+            return {tf: len(self._history[pair][tf]) for tf in CFG.TIMEFRAMES}
+
+    # ── internal ───────────────────────────────────────────────
+    @staticmethod
+    def _close(live: dict) -> dict:
+        c = live.copy()
+        c['closed'] = True
+        c['closed_at'] = now_ts()
+        return c
+
+    def _start_flush_thread(self):
+        def worker():
+            while True:
+                time.sleep(CFG.CANDLE_FLUSH_SEC)
+                with self._lock:
+                    items = self._pending_flush[:]
+                    self._pending_flush.clear()
+                for pair, tf, candle in items:
+                    date = datetime.datetime.utcfromtimestamp(
+                        candle['period_start']).strftime('%Y-%m-%d')
+                    path = CFG.DATA_DIR / 'candles' / f'{pair}_{tf}_{date}.jsonl'
+                    append_jsonl(path, candle)
+        threading.Thread(target=worker, daemon=True).start()
+
+# ═══════════════════════════════════════════════════════════════
+# 5.  ORDER BOOK STORE  — payout / trader positioning
+# ═══════════════════════════════════════════════════════════════
+class OrderBookStore:
+    """
+    Stores the payout/weight data from e:80.
+    This is our contrarian alpha: when 90% of traders bet UP, AI should lean DOWN.
+    """
+    def __init__(self):
+        self._lock    = threading.RLock()
+        self._latest: Dict[str, dict] = {}         # pair → latest snapshot
+        self._history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+
+    def update(self, pair: str, durations: List[dict], ts: float):
+        rec = {'pair': pair, 'durations': durations, 'ts': ts}
+        with self._lock:
+            self._latest[pair] = rec
+            self._history[pair].append(rec)
+        # persist
+        date = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+        path = CFG.DATA_DIR / 'orderbook' / f'{pair}_{date}.jsonl'
+        append_jsonl(path, rec)
+
+    def get_latest(self, pair: str) -> Optional[dict]:
+        with self._lock:
+            return self._latest.get(pair)
+
+    def get_history(self, pair: str, n: int = 100) -> List[dict]:
+        with self._lock:
+            return list(self._history[pair])[-n:]
+
+    def get_contrarian_signal(self, pair: str, duration_sec: int) -> dict:
+        """
+        Returns the contrarian signal for a specific trade duration.
+        If 80%+ of traders bet UP → platform likely moves DOWN → signal DOWN.
+        """
+        snap = self.get_latest(pair)
+        if not snap:
+            return {'signal': 'NONE', 'weight_up': 50, 'weight_down': 50,
+                    'payout_up': 85, 'payout_down': 85, 'strength': 0}
+        # find matching duration bucket
+        bucket = None
+        for d in snap.get('durations', []):
+            if d['min_sec'] <= duration_sec <= d['max_sec']:
+                bucket = d
+                break
+        if not bucket:
+            return {'signal': 'NONE', 'weight_up': 50, 'weight_down': 50,
+                    'payout_up': 85, 'payout_down': 85, 'strength': 0}
+        wu = bucket['weight_up']
+        wd = bucket['weight_down']
+        strength = max(wu, wd) - 50  # 0-50 scale
+        if wu > 75:
+            signal = 'DOWN'   # majority up → fade them
+        elif wd > 75:
+            signal = 'UP'
+        else:
+            signal = 'NONE'
+        return {
+            'signal':      signal,
+            'weight_up':   wu,
+            'weight_down': wd,
+            'payout_up':   bucket['payout_up'],
+            'payout_down': bucket['payout_down'],
+            'strength':    round(strength, 1)
         }
-        
-        return jsonify({
-            "status": "ok",
-            "summary": summary,
-            "detailed_analysis": analysis
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-@app.route("/indicators/<pair>/<tf>", methods=["GET"])
-def get_indicators(pair: str, tf: str):
-    """Get technical indicators for specific pair and timeframe"""
-    try:
-        indicators = candle_builder.get_indicators(pair, tf)
-        candles = candle_builder.get_historical_candles(pair, tf, 50)
-        
-        return jsonify({
-            "status": "ok",
-            "pair": pair,
-            "timeframe": tf,
-            "indicators_count": len(indicators),
-            "indicators": indicators,
-            "recent_candles": len(candles),
-            "latest_price": candles[-1].get("close") if candles else None
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+# ═══════════════════════════════════════════════════════════════
+# 6.  SENTIMENT STORE
+# ═══════════════════════════════════════════════════════════════
+class SentimentStore:
+    def __init__(self):
+        self._lock    = threading.RLock()
+        self._latest: Dict[str, dict]  = {}
+        self._history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
 
-@app.route("/health", methods=["GET"])
-def health():
-    """Health check with detailed stats"""
-    current = candle_builder.get_current_candles()
-    active_tfs = len([tf for tf in candle_builder.timeframes 
-                     if candle_builder.candle_data[tf]["start_time"]])
-    
-    return jsonify({
-        "status": "alive",
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "system": "Ultimate Trading AI v2.0",
-        "active_timeframes": active_tfs,
-        "total_timeframes": len(candle_builder.timeframes),
-        "memory_usage": "normal",
-        "uptime": time.time() - app_start_time if 'app_start_time' in globals() else 0
-    }), 200
+    def update(self, pair: str, value: float, ts: float):
+        rec = {'pair': pair, 'sentiment': value, 'ts': ts}
+        with self._lock:
+            self._latest[pair] = rec
+            self._history[pair].append(rec)
 
-@app.route("/stats", methods=["GET"])
-def stats():
-    """Get comprehensive system statistics"""
-    try:
-        # Count files
-        raw_files = list(candle_builder.prices_dir.glob("*.jsonl"))
-        candle_files = list(candle_builder.candles_dir.glob("*.jsonl"))
-        
-        # Count entries
-        raw_count = sum(1 for f in raw_files for _ in open(f, 'r', encoding='utf-8', errors='ignore'))
-        candle_count = sum(1 for f in candle_files for _ in open(f, 'r', encoding='utf-8', errors='ignore'))
-        
-        # Get current status
-        current = candle_builder.get_current_candles()
-        active_pairs = set(candle["pair"] for candle in current.values() if candle.get("pair"))
-        
-        return jsonify({
-            "status": "ok",
-            "raw_files": len(raw_files),
-            "candle_files": len(candle_files),
-            "raw_ticks": raw_count,
-            "candles": candle_count,
-            "active_timeframes": len(current),
-            "active_pairs": list(active_pairs),
-            "all_timeframes": candle_builder.timeframes,
-            "server_time": datetime.datetime.utcnow().isoformat()
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    def get_latest(self, pair: str) -> Optional[dict]:
+        with self._lock:
+            return self._latest.get(pair)
 
-@app.route("/predict/<pair>/<tf>", methods=["GET"])
-def predict(pair: str, tf: str):
-    """Make prediction for specific pair and timeframe"""
-    try:
-        # Get historical data
-        history = candle_builder.get_historical_candles(pair, tf, 100)
-        indicators = candle_builder.get_indicators(pair, tf)
-        
-        if not history or len(history) < 20:
-            return jsonify({"status": "insufficient_data", "message": "Need more historical data"}), 200
-        
-        # Simple prediction logic (to be replaced with AI model)
-        latest = history[-1]
-        prev = history[-2] if len(history) >= 2 else latest
-        
-        # Analyze trend
-        price_trend = "up" if latest.get("close", 0) > prev.get("close", 0) else "down"
-        
-        # Calculate confidence based on indicators
-        confidence = 50  # Base confidence
-        
-        if "RSI" in indicators:
-            rsi = indicators["RSI"]
-            if rsi < 30:
-                confidence += 20  # Oversold - likely to bounce up
-                price_trend = "up"
-            elif rsi > 70:
-                confidence += 20  # Overbought - likely to drop
-                price_trend = "down"
-        
-        if "change_pct" in latest:
-            change = latest["change_pct"]
-            if abs(change) > 1:
-                confidence += min(20, abs(change) * 5)
-        
-        # Clamp confidence
-        confidence = max(5, min(95, confidence))
-        
-        return jsonify({
-            "status": "ok",
-            "pair": pair,
-            "timeframe": tf,
-            "prediction": {
-                "direction": price_trend,
-                "confidence": round(confidence, 1),
-                "current_price": latest.get("close"),
-                "expected_move_pct": round(abs(latest.get("change_pct", 0)), 2),
-                "analysis": {
-                    "indicators_used": len(indicators),
-                    "pattern_count": len(latest.get("patterns", [])),
-                    "volume_trend": "high" if latest.get("volume", 0) > history[-2].get("volume", 0) else "low"
+    def get_history(self, pair: str, n: int = 200) -> List[dict]:
+        with self._lock:
+            return list(self._history[pair])[-n:]
+
+# ═══════════════════════════════════════════════════════════════
+# 7.  RAW TICK STORE  — per-second prices, kept in RAM + disk
+# ═══════════════════════════════════════════════════════════════
+class TickStore:
+    def __init__(self):
+        self._lock    = threading.RLock()
+        self._ticks: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=CFG.MAX_TICKS_RAM))
+        self._pending: List[tuple] = []
+        self._start_flush_thread()
+
+    def add(self, pair: str, price: float, ts: float):
+        rec = {'pair': pair, 'price': price, 'ts': ts}
+        with self._lock:
+            self._ticks[pair].append(rec)
+            self._pending.append((pair, rec))
+
+    def get(self, pair: str, n: int = 1000) -> List[dict]:
+        with self._lock:
+            return list(self._ticks[pair])[-n:]
+
+    def _start_flush_thread(self):
+        def worker():
+            while True:
+                time.sleep(5)
+                with self._lock:
+                    items = self._pending[:]
+                    self._pending.clear()
+                grouped: Dict[str, List] = defaultdict(list)
+                for pair, rec in items:
+                    grouped[pair].append(rec)
+                for pair, recs in grouped.items():
+                    date = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+                    path = CFG.DATA_DIR / 'ticks' / f'{pair}_{date}.jsonl'
+                    for rec in recs:
+                        append_jsonl(path, rec)
+        threading.Thread(target=worker, daemon=True).start()
+
+# ═══════════════════════════════════════════════════════════════
+# 8.  PREDICTION STORE  — AI pushes here; browser polls here
+# ═══════════════════════════════════════════════════════════════
+class PredictionStore:
+    """
+    Colab AI POSTs predictions here.
+    Tampermonkey polls /notifications every 2s.
+    Dashboard reads /predictions/{pair}.
+    """
+    def __init__(self):
+        self._lock   = threading.RLock()
+        # latest per pair+timeframe
+        self._latest: Dict[str, dict] = {}          # key = f"{pair}_{tf}"
+        # notification queue (all high-confidence predictions)
+        self._notifs: deque = deque(maxlen=CFG.MAX_NOTIFS)
+        # all predictions ever (for dashboard history)
+        self._all: deque = deque(maxlen=5000)
+        # accuracy tracking
+        self._pending_resolution: List[dict] = []   # predictions awaiting expiry
+        self._accuracy: Dict[str, dict] = defaultdict(
+            lambda: {'correct': 0, 'total': 0, 'winrate': 0.0})
+
+    def save(self, pred: dict):
+        """Called by Colab AI to store a new prediction."""
+        key = f"{pred['pair']}_{pred['timeframe']}"
+        with self._lock:
+            self._latest[key]  = pred
+            self._all.append(pred)
+            # queue for accuracy tracking
+            if pred.get('confidence', 0) >= pred.get('min_confidence', 0):
+                self._notifs.append(pred)
+                self._pending_resolution.append({
+                    **pred,
+                    'resolve_at': now_ts() + pred.get('duration_sec', 60)
+                })
+        # persist
+        date = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+        path = CFG.DATA_DIR / 'predictions' / f"{pred['pair']}_{date}.jsonl"
+        append_jsonl(path, pred)
+
+    def resolve(self, pair: str, price: float):
+        """
+        Called periodically when new price arrives.
+        Checks expired predictions, marks WIN/LOSS, updates accuracy.
+        """
+        ts = now_ts()
+        with self._lock:
+            remaining = []
+            for p in self._pending_resolution:
+                if p['pair'] != pair or ts < p['resolve_at']:
+                    remaining.append(p)
+                    continue
+                # resolve
+                entry_price = p.get('entry_price', 0)
+                if entry_price == 0:
+                    remaining.append(p)
+                    continue
+                diff = price - entry_price
+                won  = (p['direction'] == 'UP' and diff > 0) or \
+                       (p['direction'] == 'DOWN' and diff < 0)
+                key  = f"{pair}_{p['timeframe']}"
+                self._accuracy[key]['total']   += 1
+                self._accuracy[key]['correct'] += int(won)
+                t = self._accuracy[key]['total']
+                c = self._accuracy[key]['correct']
+                self._accuracy[key]['winrate'] = round(c / t * 100, 1) if t else 0
+                outcome = {**p, 'won': won, 'exit_price': price,
+                           'resolved_at': ts}
+                date = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+                path = CFG.DATA_DIR / 'predictions' / \
+                       f"{pair}_outcomes_{date}.jsonl"
+                append_jsonl(path, outcome)
+            self._pending_resolution = remaining
+
+    def get_latest(self, pair: str, tf: str) -> Optional[dict]:
+        with self._lock:
+            return self._latest.get(f'{pair}_{tf}')
+
+    def get_for_pair(self, pair: str) -> List[dict]:
+        with self._lock:
+            return [p for p in self._all if p.get('pair') == pair][-50:]
+
+    def get_notifications(self, since_ts: float, min_conf: float = 60) -> List[dict]:
+        with self._lock:
+            return [n for n in self._notifs
+                    if n.get('ts', 0) > since_ts
+                    and n.get('confidence', 0) >= min_conf]
+
+    def get_accuracy(self, pair: str, tf: str) -> dict:
+        with self._lock:
+            return self._accuracy.get(f'{pair}_{tf}',
+                   {'correct': 0, 'total': 0, 'winrate': 0.0})
+
+    def get_all_accuracy(self) -> dict:
+        with self._lock:
+            return dict(self._accuracy)
+
+# ═══════════════════════════════════════════════════════════════
+# 9.  SESSION MANAGER  — multi-user, per-session state
+# ═══════════════════════════════════════════════════════════════
+class SessionManager:
+    def __init__(self):
+        self._lock     = threading.RLock()
+        self._sessions: Dict[str, dict] = {}
+
+    def touch(self, sid: str, active_pair: Optional[str] = None,
+              min_confidence: float = 60.0) -> dict:
+        with self._lock:
+            if sid not in self._sessions:
+                self._sessions[sid] = {
+                    'id':              sid,
+                    'created':         now_ts(),
+                    'last_seen':       now_ts(),
+                    'active_pair':     active_pair,
+                    'min_confidence':  min_confidence,
+                    'last_notif_ts':   0.0,
+                    'prediction_count': 0
                 }
-            },
-            "timestamp": time.time()
-        }), 200
-        
+            else:
+                self._sessions[sid]['last_seen'] = now_ts()
+                if active_pair:
+                    self._sessions[sid]['active_pair'] = active_pair
+            return self._sessions[sid]
+
+    def get(self, sid: str) -> Optional[dict]:
+        with self._lock:
+            return self._sessions.get(sid)
+
+    def update_notif_ts(self, sid: str, ts: float):
+        with self._lock:
+            if sid in self._sessions:
+                self._sessions[sid]['last_notif_ts'] = ts
+
+    def update_min_confidence(self, sid: str, mc: float):
+        with self._lock:
+            if sid in self._sessions:
+                self._sessions[sid]['min_confidence'] = mc
+
+    def purge_old(self):
+        cutoff = now_ts() - CFG.SESSION_TTL_SEC
+        with self._lock:
+            dead = [s for s, v in self._sessions.items()
+                    if v['last_seen'] < cutoff]
+            for s in dead:
+                del self._sessions[s]
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._sessions)
+
+# ═══════════════════════════════════════════════════════════════
+# 10.  GLOBAL INSTANCES
+# ═══════════════════════════════════════════════════════════════
+candles   = CandleBuilder()
+orderbook = OrderBookStore()
+sentiment = SentimentStore()
+ticks     = TickStore()
+preds     = PredictionStore()
+sessions  = SessionManager()
+
+# server stats
+_stats = {
+    'requests':       0,
+    'ticks_received': 0,
+    'errors':         0,
+    'start_time':     now_ts()
+}
+
+# ── background: purge old sessions every hour ─────────────────
+def _session_purge_loop():
+    while True:
+        time.sleep(3600)
+        sessions.purge_old()
+threading.Thread(target=_session_purge_loop, daemon=True).start()
+
+# ═══════════════════════════════════════════════════════════════
+# 11.  FLASK APP
+# ═══════════════════════════════════════════════════════════════
+app = Flask(__name__)
+CORS(app, resources={r'/*': {'origins': '*'}})
+
+# ── middleware: count every request ───────────────────────────
+@app.before_request
+def _count():
+    _stats['requests'] += 1
+
+# ─────────────────────────────────────────────────────────────
+#  POST /tick  — Tampermonkey sends all captured WS data here
+# ─────────────────────────────────────────────────────────────
+@app.route('/tick', methods=['POST', 'OPTIONS'])
+def recv_tick():
+    if request.method == 'OPTIONS':
+        return jsonify({'ok': True})
+
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        return jsonify({'error': 'bad json'}), 400
+
+    sid         = request.headers.get('X-Session-ID') or \
+                  body.get('session_id', 'anonymous')
+    active_pair = body.get('active_pair')
+    client_ts   = body.get('client_ts', now_ts())
+    batch_items = body.get('batch', [])
+
+    if len(batch_items) > CFG.MAX_BATCH_SIZE:
+        batch_items = batch_items[:CFG.MAX_BATCH_SIZE]
+
+    # update session
+    sess = sessions.touch(sid, active_pair)
+
+    processed = 0
+    for item in batch_items:
+        t     = item.get('type', '')
+        pair  = item.get('pair', '')
+        if not pair:
+            continue
+
+        try:
+            if t == 'tick':
+                price = float(item['price'])
+                ts_   = float(item.get('ts', client_ts))
+                ticks.add(pair, price, ts_)
+                candles.tick(pair, price, ts_)
+                preds.resolve(pair, price)     # check expired predictions
+                _stats['ticks_received'] += 1
+
+            elif t == 'candle':
+                candles.ingest_candle(
+                    pair,
+                    float(item.get('open',  0)),
+                    float(item.get('high',  0)),
+                    float(item.get('low',   0)),
+                    float(item.get('close', 0)),
+                    float(item.get('ts', client_ts))
+                )
+
+            elif t == 'orderbook':
+                orderbook.update(pair, item.get('durations', []),
+                                 float(item.get('ts', client_ts)))
+
+            elif t == 'sentiment':
+                sentiment.update(pair,
+                                 float(item.get('sentiment', 50)),
+                                 float(item.get('ts', client_ts)))
+
+            elif t in ('volume', 'period_start'):
+                pass   # candle builder already gets close price from ticks
+
+            processed += 1
+        except Exception as ex:
+            _stats['errors'] += 1
+            print(f'[TICK] error on {t}/{pair}: {ex}')
+
+    return jsonify({
+        'ok':              True,
+        'processed':       processed,
+        'total_received':  _stats['ticks_received'],
+        'instruments':     len(candles.instruments()),
+        'session':         sid,
+        'active_pair':     active_pair
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /candles/<pair>/<tf>?n=500
+#  Colab AI pulls candle history for training/inference
+# ─────────────────────────────────────────────────────────────
+@app.route('/candles/<pair>/<tf>')
+def get_candles(pair, tf):
+    if tf not in CFG.TIMEFRAMES:
+        return jsonify({'error': f'unknown timeframe {tf}',
+                        'valid': list(CFG.TIMEFRAMES.keys())}), 400
+    n    = min(int(request.args.get('n', 500)), 5000)
+    data = candles.get(pair, tf, n)
+    return jsonify({
+        'pair':   pair,
+        'tf':     tf,
+        'count':  len(data),
+        'candles': data,
+        'live_price': candles.get_live_price(pair),
+        'ts':     now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /ticks/<pair>?n=500
+#  Raw price ticks per second for Colab feature extraction
+# ─────────────────────────────────────────────────────────────
+@app.route('/ticks/<pair>')
+def get_ticks(pair):
+    n    = min(int(request.args.get('n', 500)), 3000)
+    data = ticks.get(pair, n)
+    return jsonify({'pair': pair, 'count': len(data), 'ticks': data})
+
+# ─────────────────────────────────────────────────────────────
+#  GET /orderbook/<pair>?duration_sec=60
+#  Payout + contrarian signal for Colab feature extraction
+# ─────────────────────────────────────────────────────────────
+@app.route('/orderbook/<pair>')
+def get_orderbook(pair):
+    dur = int(request.args.get('duration_sec', 60))
+    return jsonify({
+        'pair':             pair,
+        'latest':           orderbook.get_latest(pair),
+        'contrarian':       orderbook.get_contrarian_signal(pair, dur),
+        'history_count':    len(orderbook.get_history(pair, 1)),
+        'ts':               now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /sentiment/<pair>
+# ─────────────────────────────────────────────────────────────
+@app.route('/sentiment/<pair>')
+def get_sentiment(pair):
+    return jsonify({
+        'pair':    pair,
+        'latest':  sentiment.get_latest(pair),
+        'history': sentiment.get_history(pair, 100),
+        'ts':      now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /state/<pair>
+#  Single endpoint: Colab pulls everything it needs in one call
+# ─────────────────────────────────────────────────────────────
+@app.route('/state/<pair>')
+def get_state(pair):
+    """
+    Colab AI polls this every 2 seconds.
+    Returns enough data to compute all 150+ features and run inference.
+    """
+    n_ticks   = int(request.args.get('ticks',   500))
+    n_candles = int(request.args.get('candles', 200))
+
+    result = {
+        'pair':      pair,
+        'ts':        now_ts(),
+        'live_price': candles.get_live_price(pair),
+        'candle_counts': candles.candle_counts(pair),
+        'candles':   {},
+        'ticks':     ticks.get(pair, n_ticks),
+        'orderbook': {
+            'latest':     orderbook.get_latest(pair),
+            'contrarian': {dur_label: orderbook.get_contrarian_signal(
+                               pair, sec)
+                           for dur_label, sec in {
+                               '15s': 15, '30s': 30, '1m': 60, '5m': 300
+                           }.items()}
+        },
+        'sentiment':   sentiment.get_latest(pair),
+        'instruments': candles.instruments()
+    }
+
+    # include candles for key timeframes (Colab can request all TFs separately)
+    for tf in ['1s', '5s', '10s', '30s', '1m', '5m', '15m', '1h']:
+        data = candles.get(pair, tf, n_candles)
+        result['candles'][tf] = data
+
+    return jsonify(result)
+
+# ─────────────────────────────────────────────────────────────
+#  POST /prediction
+#  Colab AI pushes predictions here
+# ─────────────────────────────────────────────────────────────
+@app.route('/prediction', methods=['POST'])
+def save_prediction():
+    try:
+        pred = request.get_json(force=True)
+        if not pred or 'pair' not in pred or 'direction' not in pred:
+            return jsonify({'error': 'missing required fields'}), 400
+
+        required = ['pair', 'direction', 'confidence', 'timeframe',
+                    'duration_sec', 'reason', 'ts']
+        for r in required:
+            if r not in pred:
+                pred.setdefault(r, None)
+
+        pred['received_at'] = now_ts()
+        preds.save(pred)
+
+        return jsonify({'ok': True, 'id': pred.get('id', 'unknown')})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({'error': str(e)}), 500
 
-# ================================================================
-# STARTUP
-# ================================================================
+# ─────────────────────────────────────────────────────────────
+#  GET /predictions/<pair>
+#  Dashboard fetches recent predictions for a pair
+# ─────────────────────────────────────────────────────────────
+@app.route('/predictions/<pair>')
+def get_predictions(pair):
+    tf = request.args.get('tf')
+    if tf:
+        p = preds.get_latest(pair, tf)
+        return jsonify({'pair': pair, 'tf': tf,
+                        'prediction': p,
+                        'accuracy': preds.get_accuracy(pair, tf)})
+    all_p = preds.get_for_pair(pair)
+    return jsonify({
+        'pair':        pair,
+        'predictions': all_p,
+        'accuracy':    {tf: preds.get_accuracy(pair, tf)
+                        for tf in CFG.TIMEFRAMES}
+    })
 
-app_start_time = time.time()
+# ─────────────────────────────────────────────────────────────
+#  GET /notifications?session=<id>
+#  Tampermonkey polls this every 2s — returns unseen predictions
+# ─────────────────────────────────────────────────────────────
+@app.route('/notifications')
+def get_notifications():
+    sid  = request.args.get('session', 'anonymous')
+    sess = sessions.touch(sid)
+    mc   = float(request.args.get('min_confidence',
+                  sess.get('min_confidence', 60)))
 
-if __name__ == "__main__":
-    print("=" * 70)
-    print("🚀 ULTIMATE TRADING AI SYSTEM v2.0")
-    print("=" * 70)
-    print(f"📁 Prices Directory: {candle_builder.prices_dir}")
-    print(f"📊 Candles Directory: {candle_builder.candles_dir}")
-    print(f"📈 Indicators Directory: {candle_builder.indicators_dir}")
-    print(f"🧠 Models Directory: {candle_builder.models_dir}")
-    print(f"⏱️  Total Timeframes: {len(candle_builder.timeframes)}")
-    print(f"📊 Timeframes: {', '.join(candle_builder.timeframes)}")
-    print("=" * 70)
-    print("✅ System initialized and ready for data collection!")
-    print("🌐 Endpoints available:")
-    print("   • POST /price - Send price ticks")
-    print("   • GET  /candles - Get live candles")
-    print("   • GET  /analysis/BTCUSD_OTC - Complete analysis")
-    print("   • GET  /predict/BTCUSD_OTC/5m - Make prediction")
-    print("   • GET  /health - Health check")
-    print("   • GET  /stats - System statistics")
-    print("=" * 70)
-    
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False, threaded=True)
+    since = sess.get('last_notif_ts', 0.0)
+    notifs = preds.get_notifications(since, mc)
+
+    if notifs:
+        latest_ts = max(n.get('ts', 0) for n in notifs)
+        sessions.update_notif_ts(sid, latest_ts)
+
+    return jsonify({
+        'notifications': notifs,
+        'count':         len(notifs),
+        'since':         since,
+        'ts':            now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /instruments
+#  List all instruments currently receiving data
+# ─────────────────────────────────────────────────────────────
+@app.route('/instruments')
+def get_instruments():
+    pairs = candles.instruments()
+    result = []
+    for p in pairs:
+        counts = candles.candle_counts(p)
+        ob     = orderbook.get_contrarian_signal(p, 60)
+        sent   = sentiment.get_latest(p)
+        result.append({
+            'pair':             p,
+            'live_price':       candles.get_live_price(p),
+            'candle_counts':    counts,
+            'total_1s_candles': counts.get('1s', 0),
+            'contrarian_60s':   ob,
+            'sentiment':        sent.get('sentiment') if sent else None
+        })
+    return jsonify({
+        'instruments': result,
+        'count':       len(result),
+        'ts':          now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /accuracy
+#  Overall AI accuracy across all pairs and timeframes
+# ─────────────────────────────────────────────────────────────
+@app.route('/accuracy')
+def get_accuracy():
+    return jsonify({
+        'accuracy': preds.get_all_accuracy(),
+        'ts':       now_ts()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /health  — keep-alive ping + system status
+# ─────────────────────────────────────────────────────────────
+@app.route('/health')
+def health():
+    uptime = now_ts() - _stats['start_time']
+    return jsonify({
+        'status':          'alive',
+        'uptime_sec':      round(uptime, 1),
+        'uptime_fmt':      _fmt_uptime(uptime),
+        'ticks_received':  _stats['ticks_received'],
+        'requests':        _stats['requests'],
+        'errors':          _stats['errors'],
+        'instruments':     len(candles.instruments()),
+        'active_sessions': sessions.count(),
+        'ts':              now_ts(),
+        'utc':             utc_str()
+    })
+
+# ─────────────────────────────────────────────────────────────
+#  GET /dashboard  — simple status page (full dashboard is in Colab)
+# ─────────────────────────────────────────────────────────────
+@app.route('/dashboard')
+def dashboard():
+    sid = request.args.get('session', '')
+    html = _build_status_html(sid)
+    return Response(html, mimetype='text/html')
+
+# ─────────────────────────────────────────────────────────────
+#  PUT /session/confidence?session=<id>&value=<pct>
+#  Dashboard sets min confidence for a session
+# ─────────────────────────────────────────────────────────────
+@app.route('/session/confidence', methods=['PUT', 'POST'])
+def set_confidence():
+    sid = request.args.get('session') or \
+          (request.get_json(silent=True) or {}).get('session', '')
+    val = float(request.args.get('value', 0) or
+                (request.get_json(silent=True) or {}).get('value', 60))
+    val = max(50.0, min(95.0, val))
+    sessions.update_min_confidence(sid, val)
+    return jsonify({'ok': True, 'min_confidence': val})
+
+# ═══════════════════════════════════════════════════════════════
+# 12.  SIMPLE STATUS HTML  (redirect point when users open /dashboard)
+# ═══════════════════════════════════════════════════════════════
+def _build_status_html(sid: str) -> str:
+    insts = candles.instruments()
+    rows  = ''
+    for p in insts[:30]:
+        price  = candles.get_live_price(p)
+        cnt    = candles.candle_counts(p).get('1s', 0)
+        ob     = orderbook.get_contrarian_signal(p, 60)
+        sent   = sentiment.get_latest(p)
+        sv     = sent['sentiment'] if sent else '—'
+        csig   = ob['signal']
+        csig_c = '#0f0' if csig == 'UP' else '#f44' if csig == 'DOWN' else '#888'
+        rows  += f"""
+          <tr>
+            <td><b>{p}</b></td>
+            <td>{f'{price:.5f}' if price else '—'}</td>
+            <td>{cnt}</td>
+            <td style="color:{csig_c}">{csig} ({ob['weight_up']}%↑)</td>
+            <td>{sv}</td>
+          </tr>"""
+    return f"""<!DOCTYPE html><html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="3">
+<title>Quantum AI Server</title>
+<style>
+  *{{margin:0;padding:0;box-sizing:border-box;}}
+  body{{background:#0a0f0a;color:#0f0;font-family:monospace;padding:24px;}}
+  h1{{font-size:1.5em;text-shadow:0 0 12px #0f0;margin-bottom:16px;}}
+  .pill{{display:inline-block;background:#0f01;border:1px solid #0f0;
+         border-radius:20px;padding:4px 14px;margin:0 6px 12px 0;font-size:.85em;}}
+  table{{width:100%;border-collapse:collapse;margin-top:16px;}}
+  th{{text-align:left;border-bottom:1px solid #0f0;padding:6px 10px;color:#0a0;font-size:.8em;}}
+  td{{padding:6px 10px;font-size:.85em;border-bottom:1px solid #111;}}
+  tr:hover td{{background:#011;}}
+  .note{{color:#555;font-size:.75em;margin-top:16px;}}
+</style></head><body>
+<h1>🧠 Quantum OlympTrade AI — Data Server</h1>
+<div>
+  <span class="pill">✅ LIVE</span>
+  <span class="pill">Instruments: {len(insts)}</span>
+  <span class="pill">Session: {sid[:12] + '…' if sid else '—'}</span>
+</div>
+<table>
+  <tr><th>Instrument</th><th>Live Price</th>
+      <th>1s Candles</th><th>Contrarian</th><th>Sentiment</th></tr>
+  {rows if rows else '<tr><td colspan="5" style="color:#555;padding:20px;">Waiting for data from OlympTrade…</td></tr>'}
+</table>
+<p class="note">Auto-refreshes every 3 seconds. Full dashboard is in Google Colab.</p>
+</body></html>"""
+
+# ═══════════════════════════════════════════════════════════════
+# 13.  UTILS
+# ═══════════════════════════════════════════════════════════════
+def _fmt_uptime(sec: float) -> str:
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    return f'{h:02d}h {m:02d}m {s:02d}s'
+
+# ═══════════════════════════════════════════════════════════════
+# 14.  ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    print('═' * 60)
+    print('  🧠 QUANTUM OLYMPTRADE AI — RENDER SERVER v2.0')
+    print('═' * 60)
+    print(f'  Data dir : {CFG.DATA_DIR.resolve()}')
+    print(f'  Port     : {CFG.PORT}')
+    print(f'  Timeframes: {len(CFG.TIMEFRAMES)}')
+    print()
+    print('  Endpoints:')
+    print('   POST /tick              ← Tampermonkey sends data here')
+    print('   GET  /state/<pair>      ← Colab AI pulls all features')
+    print('   GET  /candles/<pair>/<tf>  ← Colab pulls candle history')
+    print('   GET  /orderbook/<pair>  ← Colab pulls contrarian signal')
+    print('   POST /prediction        ← Colab pushes predictions')
+    print('   GET  /notifications     ← Tampermonkey polls for alerts')
+    print('   GET  /instruments       ← List all active instruments')
+    print('   GET  /accuracy          ← Overall AI accuracy')
+    print('   GET  /health            ← Keep-alive ping')
+    print('   GET  /dashboard         ← Status page')
+    print('═' * 60)
+    app.run(host='0.0.0.0', port=CFG.PORT,
+            debug=False, threaded=True, use_reloader=False)
