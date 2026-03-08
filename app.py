@@ -531,7 +531,8 @@ def _count():
 # ─────────────────────────────────────────────────────────────
 #  POST /tick  — Tampermonkey sends all captured WS data here
 # ─────────────────────────────────────────────────────────────
-@app.route('/tick', methods=['POST', 'OPTIONS'])
+@app.route('/tick',  methods=['POST', 'OPTIONS'])
+@app.route('/price', methods=['POST', 'OPTIONS'])   # ← alias for old script
 def recv_tick():
     if request.method == 'OPTIONS':
         return jsonify({'ok': True})
@@ -543,9 +544,34 @@ def recv_tick():
 
     sid         = request.headers.get('X-Session-ID') or \
                   body.get('session_id', 'anonymous')
-    active_pair = body.get('active_pair')
-    client_ts   = body.get('client_ts', now_ts())
+    active_pair = body.get('active_pair') or body.get('pairFilter')
+    client_ts   = body.get('client_ts', body.get('timestamp', now_ts()))
     batch_items = body.get('batch', [])
+
+    # ── handle old v1 script format ──────────────────────────────
+    # Old script sent: { batch: [{pair, price, timestamp, event_type, ...}] }
+    # Convert old-style tick items to new format
+    converted = []
+    for item in batch_items:
+        if 'event_type' in item or 'price' in item:
+            # old format — wrap as new tick
+            converted.append({
+                'type':  'tick',
+                'pair':  item.get('pair', active_pair or 'UNKNOWN'),
+                'price': float(item.get('price', item.get('q', 0))),
+                'ts':    float(item.get('timestamp', item.get('ts', client_ts)))
+            })
+            # also handle old order_book key
+            if 'order_book' in item:
+                converted.append({
+                    'type':  'orderbook',
+                    'pair':  item.get('pair', active_pair or 'UNKNOWN'),
+                    'durations': item.get('order_book', []),
+                    'ts':    float(item.get('timestamp', client_ts))
+                })
+        else:
+            converted.append(item)
+    batch_items = converted
 
     if len(batch_items) > CFG.MAX_BATCH_SIZE:
         batch_items = batch_items[:CFG.MAX_BATCH_SIZE]
@@ -566,8 +592,17 @@ def recv_tick():
                 ts_   = float(item.get('ts', client_ts))
                 ticks.add(pair, price, ts_)
                 candles.tick(pair, price, ts_)
-                preds.resolve(pair, price)     # check expired predictions
+                preds.resolve(pair, price)
                 _stats['ticks_received'] += 1
+
+                # ── OTC PAIRS: synthesize 1s candles from ticks ────────────
+                # e.g. DOGUSD_OTC, EURUSD_OTC etc. never appear in e:1003
+                # so we build their 1s candle explicitly from every tick
+                # (CandleBuilder.tick() already does this — call ingest too
+                #  so the candle is stored in _history for fast retrieval)
+                if '_OTC' in pair or '_otc' in pair.lower():
+                    candles.ingest_candle(
+                        pair, price, price, price, price, ts_)
 
             elif t == 'candle':
                 candles.ingest_candle(
@@ -589,7 +624,7 @@ def recv_tick():
                                  float(item.get('ts', client_ts)))
 
             elif t in ('volume', 'period_start'):
-                pass   # candle builder already gets close price from ticks
+                pass
 
             processed += 1
         except Exception as ex:
@@ -854,8 +889,11 @@ def set_confidence():
 # ═══════════════════════════════════════════════════════════════
 def _build_status_html(sid: str) -> str:
     insts = candles.instruments()
+    # show OTC pairs first, then the rest
+    otc   = sorted([p for p in insts if '_OTC' in p or '_otc' in p.lower()])
+    rest  = sorted([p for p in insts if p not in otc])
     rows  = ''
-    for p in insts[:30]:
+    for p in (otc + rest)[:50]:
         price  = candles.get_live_price(p)
         cnt    = candles.candle_counts(p).get('1s', 0)
         ob     = orderbook.get_contrarian_signal(p, 60)
@@ -863,9 +901,14 @@ def _build_status_html(sid: str) -> str:
         sv     = sent['sentiment'] if sent else '—'
         csig   = ob['signal']
         csig_c = '#0f0' if csig == 'UP' else '#f44' if csig == 'DOWN' else '#888'
+        is_otc = '_OTC' in p or '_otc' in p.lower()
+        src    = '<span style="color:#0ff;font-size:9px">● e:1 ticks</span>' \
+                 if is_otc else \
+                 '<span style="color:#555;font-size:9px">● e:1003</span>'
+        name_cell = f'<b style="color:{"#0ff" if is_otc else "#0f0"}">{p}</b> {src}'
         rows  += f"""
           <tr>
-            <td><b>{p}</b></td>
+            <td>{name_cell}</td>
             <td>{f'{price:.5f}' if price else '—'}</td>
             <td>{cnt}</td>
             <td style="color:{csig_c}">{csig} ({ob['weight_up']}%↑)</td>
